@@ -86,6 +86,23 @@ Run maintenance immediately only when interrupting current builds is acceptable:
 ~/Library/Application\ Support/BuildAgentMaintenance/build-agent-maintenance.sh --run-once
 ```
 
+## Manual full cleanup
+
+The installer adds a `bama-clean` command to new zsh sessions. It ignores the scheduled-run record
+and performs maintenance immediately:
+
+```bash
+bama-clean
+```
+
+This mode always removes every discovered agent `_work` directory, even when free disk space is at
+or above 20 percent. It also shuts down simulators, removes Xcode DerivedData, and terminates the
+configured build-process categories. Preview the complete run without changing anything:
+
+```bash
+bama-clean --dry-run
+```
+
 ## Uninstall
 
 ```bash

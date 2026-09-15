@@ -45,6 +45,16 @@ assert_equal '2100' "$(normalize_schedule_time 2100)" '2100 remains 21:00'
 assert_failure '2460 is rejected' normalize_schedule_time 2460
 assert_failure '2401 is rejected' normalize_schedule_time 2401
 
+assert_success 'manual full-clean arguments are accepted' parse_arguments --run-once --full-clean
+assert_equal '--run-once' "$MODE" 'manual full-clean uses run-once mode'
+assert_equal '1' "$FULL_CLEAN" 'manual full-clean enables forced cleanup'
+assert_failure 'full-clean is rejected for daemon mode' parse_arguments --daemon --full-clean
+assert_success 'ordinary run-once arguments remain accepted' parse_arguments --run-once
+assert_equal '0' "$FULL_CLEAN" 'ordinary run-once keeps disk-threshold cleanup'
+
+assert_failure 'disk threshold skips work cleanup at 20 percent' work_cleanup_is_required 20 0 20
+assert_success 'full-clean forces work cleanup at 20 percent' work_cleanup_is_required 20 1 20
+
 DISCOVERED_AGENTS=("/Users/example/azba/agent-01")
 assert_equal 'Node.js' "$(classify_process_command '/opt/homebrew/bin/node app.js')" 'Node.js is selected'
 assert_equal 'Watchman' "$(classify_process_command '/opt/homebrew/bin/watchman --foreground')" 'Watchman is selected'

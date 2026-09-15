@@ -24,6 +24,8 @@ LOCK_DIR="${STATE_DIR}/maintenance.lock"
 SCHEDULE_STATE_FILE="${STATE_DIR}/last-schedule-slot"
 LOG_FILE=""
 DRY_RUN=0
+FULL_CLEAN=0
+MODE=""
 RECOVERY_ACTIVE=0
 HEARTBEAT_PID=""
 LOCK_ACQUIRED=0
@@ -653,6 +655,11 @@ clean_xcode_derived_data() {
     return 0
 }
 
+work_cleanup_is_required() {
+    local free=$1 force=$2 minimum=$3
+    [ "$force" -eq 1 ] || [ "$free" -lt "$minimum" ]
+}
+
 free_disk_percent() {
     /bin/df -Pk "$1" | /usr/bin/awk 'NR == 2 { gsub(/%/, "", $5); print 100 - $5 }'
 }
@@ -678,14 +685,18 @@ clean_work_directories_if_low_disk() {
         [ "$free" -lt "$minimum" ] && minimum=$free
     done
     log INFO "Disk free space is ${minimum}%. Required minimum is ${MINIMUM_FREE_DISK_PERCENT}%."
-    if [ "$minimum" -ge "$MINIMUM_FREE_DISK_PERCENT" ]; then
+    if ! work_cleanup_is_required "$minimum" "$FULL_CLEAN" "$MINIMUM_FREE_DISK_PERCENT"; then
         return 0
     fi
     if ! recovery_is_owned_by_current_process || ! all_agents_are_stopped; then
         log ERROR "Work-directory cleanup blocked because the recovery lease is missing or an agent is running."
         return 1
     fi
-    log WARN "Disk free space is below the limit. Every discovered agent _work directory will be removed."
+    if [ "$FULL_CLEAN" -eq 1 ]; then
+        log WARN "Full cleanup requested. Every discovered agent _work directory will be removed."
+    else
+        log WARN "Disk free space is below the limit. Every discovered agent _work directory will be removed."
+    fi
     for agent in "${DISCOVERED_AGENTS[@]}"; do
         if ! recovery_is_owned_by_current_process || ! all_agents_are_stopped; then
             log ERROR "Work-directory cleanup aborted because the recovery lease changed or an agent restarted."
@@ -875,24 +886,37 @@ run_daemon() {
 }
 
 usage() {
-    /usr/bin/printf '%s\n' 'Usage: build-agent-maintenance.sh --daemon | --run-once [--dry-run] | --recover'
+    /usr/bin/printf '%s\n' 'Usage: build-agent-maintenance.sh --daemon | --run-once [--full-clean] [--dry-run] | --recover'
 }
 
-main() {
-    local mode="" argument
+parse_arguments() {
+    local argument
+    MODE=""
+    DRY_RUN=0
+    FULL_CLEAN=0
     for argument in "$@"; do
         case "$argument" in
-            --daemon|--run-once|--recover) [ -z "$mode" ] || { usage; return 2; }; mode=$argument ;;
+            --daemon|--run-once|--recover) [ -z "$MODE" ] || { usage; return 2; }; MODE=$argument ;;
             --dry-run) DRY_RUN=1 ;;
+            --full-clean) FULL_CLEAN=1 ;;
             *) usage; return 2 ;;
         esac
     done
-    [ -n "$mode" ] || { usage; return 2; }
+    [ -n "$MODE" ] || { usage; return 2; }
+    if [ "$FULL_CLEAN" -eq 1 ] && [ "$MODE" != '--run-once' ]; then
+        usage
+        return 2
+    fi
+    return 0
+}
+
+main() {
+    parse_arguments "$@" || return $?
     validate_dependencies || return 1
     ensure_runtime_directories
     trap on_exit EXIT
     trap handle_signal HUP INT TERM
-    case "$mode" in
+    case "$MODE" in
         --daemon) run_daemon ;;
         --run-once) run_maintenance ;;
         --recover)

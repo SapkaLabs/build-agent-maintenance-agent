@@ -9,6 +9,9 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
 INSTALL_DIR="${HOME}/Library/Application Support/${PROGRAM_NAME}"
 PLIST_DIR="${HOME}/Library/LaunchAgents"
 LOG_DIR="${HOME}/Library/Logs/${PROGRAM_NAME}"
+SHELL_PROFILE="${HOME}/.zshrc"
+PROFILE_MARKER_BEGIN='# BuildAgentMaintenance command: begin'
+PROFILE_MARKER_END='# BuildAgentMaintenance command: end'
 MAIN_PLIST="${PLIST_DIR}/${LABEL}.plist"
 WATCHDOG_PLIST="${PLIST_DIR}/${WATCHDOG_LABEL}.plist"
 DOMAIN="gui/$(/usr/bin/id -u)"
@@ -28,6 +31,15 @@ escaped_log=$(/usr/bin/printf '%s' "$LOG_DIR" | xml_escape)
 /bin/mkdir -p "$INSTALL_DIR" "$PLIST_DIR" "$LOG_DIR"
 /usr/bin/install -m 700 "${SCRIPT_DIR}/build-agent-maintenance.sh" "${INSTALL_DIR}/build-agent-maintenance.sh"
 /usr/bin/install -m 700 "${SCRIPT_DIR}/build-agent-watchdog.sh" "${INSTALL_DIR}/build-agent-watchdog.sh"
+/usr/bin/install -m 600 "${SCRIPT_DIR}/build-agent-maintenance.zsh" "${INSTALL_DIR}/build-agent-maintenance.zsh"
+
+/usr/bin/touch "$SHELL_PROFILE"
+if ! /usr/bin/grep -Fqx "$PROFILE_MARKER_BEGIN" "$SHELL_PROFILE"; then
+    /usr/bin/printf '\n%s\n%s\n%s\n' \
+        "$PROFILE_MARKER_BEGIN" \
+        'source "$HOME/Library/Application Support/BuildAgentMaintenance/build-agent-maintenance.zsh"' \
+        "$PROFILE_MARKER_END" >> "$SHELL_PROFILE"
+fi
 
 /bin/cat > "$MAIN_PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -81,3 +93,4 @@ EOF
 
 /usr/bin/printf 'Installed %s in %s\n' "$LABEL" "$INSTALL_DIR"
 /usr/bin/printf 'Schedule: 2100, 2400, 0230 local time. Installation does not run maintenance immediately.\n'
+/usr/bin/printf 'Open a new zsh session, then run bama-clean for an immediate full cleanup.\n'

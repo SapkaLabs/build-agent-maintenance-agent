@@ -5,6 +5,8 @@ MAINTENANCE_TIMES=("2100" "2400" "0230")
 MINIMUM_FREE_DISK_PERCENT=20
 BUILD_DRAIN_SECONDS=30
 SIMULATOR_SHUTDOWN_WAIT_SECONDS=30
+DOCKER_STOP_WAIT_SECONDS=30
+DOCKER_START_WAIT_SECONDS=120
 PROCESS_TERM_WAIT_SECONDS=10
 WORK_DELETE_RETRIES=3
 WORK_DELETE_RETRY_SECONDS=5
@@ -12,6 +14,7 @@ SCHEDULER_POLL_SECONDS=15
 WATCHDOG_HARD_TIMEOUT_SECONDS=3600
 AGENT_SEARCH_ROOTS=("${HOME}/azba")
 XCODE_DERIVED_DATA_DIR="${HOME}/Library/Developer/Xcode/DerivedData"
+DOCKER_APP_PATH="/Applications/Docker.app"
 
 set -o pipefail
 
@@ -26,6 +29,8 @@ LOG_FILE=""
 DRY_RUN=0
 FULL_CLEAN=0
 MODE=""
+DOCKER_CLI="${BAMA_DOCKER_CLI:-}"
+DOCKER_RESTART_REQUIRED=0
 RECOVERY_ACTIVE=0
 HEARTBEAT_PID=""
 LOCK_ACQUIRED=0
@@ -66,13 +71,77 @@ ensure_runtime_directories() {
 validate_dependencies() {
     local command missing
     missing=0
-    for command in /bin/bash /bin/cat /bin/chmod /bin/date /bin/df /bin/kill /bin/launchctl /bin/mkdir /bin/mv /bin/ps /bin/rm /bin/rmdir /bin/sleep /usr/bin/awk /usr/bin/basename /usr/bin/dirname /usr/bin/find /usr/bin/install /usr/bin/osascript /usr/bin/printf /usr/bin/python3 /usr/bin/sed /usr/bin/sort /usr/bin/stat /usr/bin/touch /usr/bin/tr /usr/bin/wc /usr/bin/xcrun; do
+    for command in /bin/bash /bin/cat /bin/chmod /bin/date /bin/df /bin/kill /bin/launchctl /bin/mkdir /bin/mv /bin/ps /bin/rm /bin/rmdir /bin/sleep /usr/bin/awk /usr/bin/basename /usr/bin/dirname /usr/bin/find /usr/bin/grep /usr/bin/install /usr/bin/osascript /usr/bin/printf /usr/bin/python3 /usr/bin/sed /usr/bin/sort /usr/bin/stat /usr/bin/touch /usr/bin/tr /usr/bin/wc /usr/bin/xcrun; do
         if [ ! -x "$command" ]; then
             log ERROR "Required executable is missing: $command"
             missing=1
         fi
     done
     [ "$missing" -eq 0 ]
+}
+
+resolve_docker_cli() {
+    local candidate
+    if [ -n "$DOCKER_CLI" ] && [ -x "$DOCKER_CLI" ]; then
+        return 0
+    fi
+    DOCKER_CLI=""
+    for candidate in "${HOME}/.docker/bin/docker" /usr/local/bin/docker /opt/homebrew/bin/docker "${DOCKER_APP_PATH}/Contents/Resources/bin/docker"; do
+        if [ -x "$candidate" ]; then
+            DOCKER_CLI=$candidate
+            return 0
+        fi
+    done
+    return 1
+}
+
+docker_status_is_running() {
+    local compact
+    compact=$(/usr/bin/printf '%s' "$1" | /usr/bin/tr -d '[:space:]')
+    case "$compact" in
+        *'"Status":"running"'*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+docker_desktop_process_is_present() {
+    local command
+    while IFS= read -r command; do
+        while [ "${command# }" != "$command" ]; do command=${command# }; done
+        case "$command" in
+            "${DOCKER_APP_PATH}"/*) return 0 ;;
+        esac
+    done < <(/bin/ps -axo command= 2>/dev/null)
+    return 1
+}
+
+docker_desktop_is_running() {
+    local status
+    resolve_docker_cli || return 1
+    if status=$("$DOCKER_CLI" desktop status --format json 2>/dev/null); then
+        docker_status_is_running "$status"
+        return $?
+    fi
+    docker_desktop_process_is_present
+}
+
+detect_docker_recovery_requirement() {
+    DOCKER_RESTART_REQUIRED=0
+    if [ ! -d "$DOCKER_APP_PATH" ]; then
+        log INFO "Docker Desktop is not installed at $DOCKER_APP_PATH."
+        return 0
+    fi
+    if ! resolve_docker_cli; then
+        log ERROR "Docker Desktop is installed, but its CLI could not be found."
+        return 1
+    fi
+    DOCKER_RESTART_REQUIRED=1
+    if docker_desktop_is_running && "$DOCKER_CLI" info >/dev/null 2>&1; then
+        log INFO "Docker Desktop is running and will be restarted after maintenance."
+    else
+        log INFO "Docker Desktop is installed but its engine is stopped. Maintenance will start it for cleanup and leave it running."
+    fi
+    return 0
 }
 
 start_run_log() {
@@ -251,6 +320,9 @@ write_recovery_marker() {
     for agent in "${DISCOVERED_AGENTS[@]}"; do
         /usr/bin/printf '%s\n' "$agent" >> "${temporary}/agents"
     done
+    if [ "$DOCKER_RESTART_REQUIRED" -eq 1 ]; then
+        : > "${temporary}/restart-docker"
+    fi
     /usr/bin/touch "${temporary}/heartbeat"
     /bin/mv "$temporary" "$RECOVERY_DIR" || return 1
     RECOVERY_ACTIVE=1
@@ -281,13 +353,77 @@ stop_heartbeat() {
 remove_recovery_marker() {
     [ "$DRY_RUN" -eq 1 ] && return 0
     [ -d "$RECOVERY_DIR" ] || return 0
-    /bin/rm -f "${RECOVERY_DIR}/owner-pid" "${RECOVERY_DIR}/started-epoch" "${RECOVERY_DIR}/agents" "${RECOVERY_DIR}/heartbeat"
+    /bin/rm -f "${RECOVERY_DIR}/owner-pid" "${RECOVERY_DIR}/started-epoch" "${RECOVERY_DIR}/agents" "${RECOVERY_DIR}/heartbeat" "${RECOVERY_DIR}/restart-docker"
     /bin/rmdir "$RECOVERY_DIR" 2>/dev/null || return 1
 }
 
-restart_agents_from_marker() {
+docker_restart_was_requested() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        [ "$DOCKER_RESTART_REQUIRED" -eq 1 ]
+    else
+        [ -f "${RECOVERY_DIR}/restart-docker" ]
+    fi
+}
+
+ensure_docker_desktop_running() {
+    local output deadline remaining
+    if ! resolve_docker_cli; then
+        log ERROR "Docker Desktop could not start because its CLI could not be found."
+        return 1
+    fi
+    if docker_desktop_is_running && "$DOCKER_CLI" info >/dev/null 2>&1; then
+        log INFO "Docker Desktop is already running and its engine is ready."
+        return 0
+    fi
+    log INFO "Starting Docker Desktop."
+    if ! output=$("$DOCKER_CLI" desktop start --timeout "$DOCKER_START_WAIT_SECONDS" 2>&1); then
+        log ERROR "Docker Desktop start failed: $output"
+        return 1
+    fi
+    deadline=$(( $(/bin/date '+%s') + DOCKER_START_WAIT_SECONDS ))
+    while ! "$DOCKER_CLI" info >/dev/null 2>&1; do
+        remaining=$((deadline - $(/bin/date '+%s')))
+        if [ "$remaining" -le 0 ]; then
+            log ERROR "Docker Desktop did not become ready after ${DOCKER_START_WAIT_SECONDS} seconds."
+            return 1
+        fi
+        log INFO "Waiting for the Docker engine. ${remaining} second(s) remain."
+        /bin/sleep 1
+    done
+    log INFO "Docker Desktop is running and its engine is ready."
+    return 0
+}
+
+prepare_docker_for_cleanup() {
+    docker_restart_was_requested || return 0
+    if ! recovery_is_owned_by_current_process || ! all_agents_are_stopped; then
+        log ERROR "Docker Desktop startup blocked because the recovery lease is missing or an agent is running."
+        return 1
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        if docker_desktop_is_running && "$DOCKER_CLI" info >/dev/null 2>&1; then
+            log DRYRUN "Docker Desktop is ready for cleanup."
+        else
+            log DRYRUN "Would start Docker Desktop and wait up to ${DOCKER_START_WAIT_SECONDS} seconds for its engine before cleanup."
+        fi
+        return 0
+    fi
+    ensure_docker_desktop_running
+}
+
+restart_docker_from_marker() {
+    docker_restart_was_requested || return 0
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log DRYRUN "Would restart Docker Desktop and wait up to ${DOCKER_START_WAIT_SECONDS} seconds for its engine."
+        return 0
+    fi
+    ensure_docker_desktop_running
+}
+
+restart_services_from_marker() {
     local agent failed
     failed=0
+    restart_docker_from_marker || failed=1
     if [ "$DRY_RUN" -eq 1 ]; then
         for agent in "${DISCOVERED_AGENTS[@]}"; do
             start_agent "$agent" || failed=1
@@ -313,10 +449,10 @@ restart_agents_from_marker() {
     fi
     if [ "$failed" -eq 0 ]; then
         RECOVERY_ACTIVE=0
-        log INFO "All agent services are running."
+        log INFO "All required services are running."
         return 0
     fi
-    log ERROR "One or more agents could not be restarted. The watchdog will retry."
+    log ERROR "One or more recovery services could not be restarted. The watchdog will retry."
     return 1
 }
 
@@ -348,9 +484,9 @@ recover_if_abandoned() {
         log INFO "Another maintenance process owns the active recovery marker."
         return 2
     fi
-    log WARN "Recovering agents from an abandoned maintenance run."
+    log WARN "Recovering services from an abandoned maintenance run."
     RECOVERY_ACTIVE=1
-    restart_agents_from_marker
+    restart_services_from_marker
 }
 
 drain_and_stop_agents() {
@@ -408,6 +544,77 @@ all_agents_are_stopped() {
     for agent in "${DISCOVERED_AGENTS[@]}"; do
         agent_is_running "$agent" && return 1
     done
+    return 0
+}
+
+prune_docker_unused_data() {
+    local output output_line
+    if ! docker_restart_was_requested; then
+        log INFO "Docker Desktop was not running, so Docker cleanup is skipped."
+        return 0
+    fi
+    if ! recovery_is_owned_by_current_process || ! all_agents_are_stopped; then
+        log ERROR "Docker cleanup blocked because the recovery lease is missing or an agent is running."
+        return 1
+    fi
+    if ! resolve_docker_cli; then
+        log ERROR "Docker cleanup failed because its CLI could not be found."
+        return 1
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log DRYRUN "Would run docker system prune --force. Docker volumes are excluded."
+        return 0
+    fi
+    log WARN "Pruning stopped containers, unused networks, dangling images, and build cache. Docker volumes are excluded."
+    if ! output=$("$DOCKER_CLI" system prune --force 2>&1); then
+        log ERROR "Docker prune failed: $output"
+        return 1
+    fi
+    while IFS= read -r output_line; do
+        [ -n "$output_line" ] && log INFO "Docker: $output_line"
+    done <<EOF
+$output
+EOF
+    return 0
+}
+
+stop_docker_desktop() {
+    local output
+    if ! docker_restart_was_requested; then
+        return 0
+    fi
+    if ! recovery_is_owned_by_current_process || ! all_agents_are_stopped; then
+        log ERROR "Docker Desktop stop blocked because the recovery lease is missing or an agent is running."
+        return 1
+    fi
+    if ! resolve_docker_cli; then
+        log ERROR "Docker Desktop stop failed because its CLI could not be found."
+        return 1
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log DRYRUN "Would stop Docker Desktop, waiting up to ${DOCKER_STOP_WAIT_SECONDS} seconds before a forced stop."
+        return 0
+    fi
+    if ! docker_desktop_is_running && ! docker_desktop_process_is_present; then
+        log INFO "Docker Desktop is already stopped. It remains scheduled for recovery."
+        return 0
+    fi
+    log INFO "Stopping Docker Desktop."
+    if ! output=$("$DOCKER_CLI" desktop stop --timeout "$DOCKER_STOP_WAIT_SECONDS" 2>&1); then
+        log WARN "Normal Docker Desktop stop failed. Retrying with --force: $output"
+    fi
+    if docker_desktop_is_running || docker_desktop_process_is_present; then
+        log WARN "Docker Desktop processes remain after the normal stop. Retrying with --force."
+        if ! output=$("$DOCKER_CLI" desktop stop --force --timeout "$DOCKER_STOP_WAIT_SECONDS" 2>&1); then
+            log ERROR "Forced Docker Desktop stop failed: $output"
+            return 1
+        fi
+    fi
+    if docker_desktop_is_running || docker_desktop_process_is_present; then
+        log ERROR "Docker Desktop processes remain after the forced stop."
+        return 1
+    fi
+    log INFO "Docker Desktop is stopped."
     return 0
 }
 
@@ -803,14 +1010,25 @@ run_maintenance() {
             return 1
         fi
     fi
+    if ! detect_docker_recovery_requirement; then
+        log ERROR "Could not establish the Docker Desktop recovery state. No services were stopped."
+        release_maintenance_lock
+        return 1
+    fi
     if ! write_recovery_marker; then
-        log ERROR "Could not create the recovery marker. No agents were stopped."
+        log ERROR "Could not create the recovery marker. No services were stopped."
         release_maintenance_lock
         return 1
     fi
     start_heartbeat
     failed=0
     if ! drain_and_stop_agents; then
+        failed=1
+    elif ! prepare_docker_for_cleanup; then
+        failed=1
+    elif ! prune_docker_unused_data; then
+        failed=1
+    elif ! stop_docker_desktop; then
         failed=1
     elif ! shutdown_booted_simulators; then
         failed=1
@@ -822,7 +1040,7 @@ run_maintenance() {
         failed=1
     fi
     stop_heartbeat
-    restart_agents_from_marker || failed=1
+    restart_services_from_marker || failed=1
     release_maintenance_lock
     if [ "$failed" -eq 0 ]; then
         notify_user "Maintenance finished and all build agents are running."
@@ -839,8 +1057,8 @@ on_exit() {
     trap - EXIT HUP INT TERM
     stop_heartbeat
     if [ "$RECOVERY_ACTIVE" -eq 1 ]; then
-        log WARN "Process exit detected during maintenance. Restarting agents from the recovery marker."
-        restart_agents_from_marker || true
+        log WARN "Process exit detected during maintenance. Restarting services from the recovery marker."
+        restart_services_from_marker || true
     fi
     release_maintenance_lock
     exit "$code"
@@ -924,7 +1142,7 @@ main() {
             discover_agents || true
             if [ -d "$RECOVERY_DIR" ]; then
                 RECOVERY_ACTIVE=1
-                restart_agents_from_marker
+                restart_services_from_marker
             else
                 log INFO "No recovery marker exists."
             fi

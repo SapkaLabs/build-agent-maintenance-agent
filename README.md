@@ -4,7 +4,7 @@ Scheduled maintenance for self-hosted Azure Pipelines agents on the Inphiz Mac m
 
 The service runs as the same macOS user as the agents. It drains and stops every discovered agent,
 removes stale build processes, checks free disk space, and starts every agent again. A separate
-launchd watchdog starts the agents if the maintenance process exits before recovery.
+launchd watchdog restarts Docker Desktop and the agents if maintenance exits before recovery.
 
 ## Default schedule and limits
 
@@ -16,6 +16,8 @@ MAINTENANCE_TIMES=("2100" "2400" "0230")
 MINIMUM_FREE_DISK_PERCENT=20
 BUILD_DRAIN_SECONDS=30
 SIMULATOR_SHUTDOWN_WAIT_SECONDS=30
+DOCKER_STOP_WAIT_SECONDS=30
+DOCKER_START_WAIT_SECONDS=120
 ```
 
 `2400` means midnight. Times use the Mac's local time. The daemon records completed slots, so a
@@ -24,14 +26,21 @@ launchd restart during the same minute does not run maintenance twice.
 ## What one maintenance run does
 
 1. Finds configured Azure agents below `~/azba` by locating `.agent`, `.service`, and `svc.sh`.
-2. Writes a recovery marker before stopping anything.
+2. Writes a recovery marker containing the agents and whether Docker Desktop is installed.
 3. Waits up to 30 seconds for active `Agent.Worker` processes. It stops each idle agent immediately.
 4. Confirms every agent service is stopped. Cleanup does not run if this check fails.
-5. Shuts down all booted Apple Simulator devices and waits up to 30 seconds for shutdown.
-6. Sends `TERM`, waits up to 10 seconds, then sends `KILL` to remaining targeted processes.
-7. Removes `~/Library/Developer/Xcode/DerivedData` after validating the path is not a symlink.
-8. Deletes each agent's `_work` directory only when disk free space is below 20 percent.
-9. Starts every discovered agent and removes the recovery marker after all starts succeed.
+5. Starts Docker Desktop when needed, then runs `docker system prune --force` without `--volumes`.
+6. Stops Docker Desktop, retrying with Docker's force option when processes remain after 30 seconds.
+7. Shuts down all booted Apple Simulator devices and waits up to 30 seconds for shutdown.
+8. Sends `TERM`, waits up to 10 seconds, then sends `KILL` to remaining targeted processes.
+9. Removes `~/Library/Developer/Xcode/DerivedData` after validating the path is not a symlink.
+10. Deletes each agent's `_work` directory only when disk free space is below 20 percent.
+11. Starts Docker Desktop, waits up to 120 seconds for its engine, then starts every agent.
+
+Docker's default system prune removes stopped containers, unused networks, dangling images, and
+unused build cache. It does not remove volumes. Volumes remain excluded because an unused volume
+may contain persistent data. See Docker's
+[`docker system prune` documentation](https://docs.docker.com/reference/cli/docker/system/prune/).
 
 The cleanup targets orphaned Azure `Agent.Worker` processes, all processes whose command belongs to
 an agent `_work` directory, all Node.js and Watchman processes, Android build and emulator
@@ -45,8 +54,9 @@ goes to `~/Library/Logs/BuildAgentMaintenance`.
 
 Normal errors and termination signals run the restart code through an exit trap. A second launchd
 job checks the recovery marker every 15 seconds. If the main process crashes, receives `SIGKILL`, or
-the Mac reboots during maintenance, the watchdog starts every agent listed in the marker. It keeps
-the marker when any start fails and retries on its next pass.
+the Mac reboots during maintenance, the watchdog starts Docker Desktop when it is installed, then
+starts every agent listed in the marker. It keeps the marker when any start fails and retries on its
+next pass.
 
 The watchdog also treats maintenance lasting more than one hour as failed. Change
 `WATCHDOG_HARD_TIMEOUT_SECONDS` in both scripts if `_work` deletion can legitimately take longer.
@@ -96,8 +106,9 @@ bama-clean
 ```
 
 This mode always removes every discovered agent `_work` directory, even when free disk space is at
-or above 20 percent. It also shuts down simulators, removes Xcode DerivedData, and terminates the
-configured build-process categories. Preview the complete run without changing anything:
+or above 20 percent. It also prunes and restarts Docker Desktop, shuts down simulators, removes
+Xcode DerivedData, and terminates the configured build-process categories. Preview the complete run
+without changing anything:
 
 ```bash
 bama-clean --dry-run

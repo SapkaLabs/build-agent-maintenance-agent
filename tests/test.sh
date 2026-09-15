@@ -102,6 +102,51 @@ HOME=$saved_home
 RECOVERY_DIR=$saved_recovery_dir
 XCODE_DERIVED_DATA_DIR=$saved_derived_data_dir
 
+docker_state="${temporary}/docker-state"
+docker_capture="${temporary}/docker-capture"
+fake_docker="${temporary}/docker"
+/usr/bin/printf '%s\n' \
+    '#!/bin/bash' \
+    'case "$*" in' \
+    '    "desktop status --format json") state=$(/bin/cat "$BAMA_TEST_DOCKER_STATE"); /usr/bin/printf '\''{"Status":"%s"}\n'\'' "$state" ;;' \
+    '    "system prune --force") /usr/bin/printf '\''%s\n'\'' "$*" > "$BAMA_TEST_DOCKER_CAPTURE" ;;' \
+    '    "desktop stop --timeout 30") /usr/bin/printf '\''stopped\n'\'' > "$BAMA_TEST_DOCKER_STATE" ;;' \
+    '    "desktop stop --force --timeout 30") /usr/bin/printf '\''stopped\n'\'' > "$BAMA_TEST_DOCKER_STATE" ;;' \
+    '    "desktop start --timeout 120") /usr/bin/printf '\''running\n'\'' > "$BAMA_TEST_DOCKER_STATE" ;;' \
+    '    "info") [ "$(/bin/cat "$BAMA_TEST_DOCKER_STATE")" = running ] ;;' \
+    '    *) exit 2 ;;' \
+    'esac' > "$fake_docker"
+/bin/chmod 700 "$fake_docker"
+/usr/bin/printf 'stopped\n' > "$docker_state"
+export BAMA_TEST_DOCKER_STATE=$docker_state
+export BAMA_TEST_DOCKER_CAPTURE=$docker_capture
+saved_docker_cli=$DOCKER_CLI
+saved_docker_app_path=$DOCKER_APP_PATH
+saved_docker_restart_required=$DOCKER_RESTART_REQUIRED
+saved_recovery_dir=$RECOVERY_DIR
+DOCKER_CLI=$fake_docker
+DOCKER_APP_PATH="${temporary}/Docker.app"
+DOCKER_RESTART_REQUIRED=1
+RECOVERY_DIR="${temporary}/docker-recovery"
+DISCOVERED_AGENTS=()
+/bin/mkdir -p "$RECOVERY_DIR"
+/usr/bin/printf '%s\n' "$$" > "${RECOVERY_DIR}/owner-pid"
+: > "${RECOVERY_DIR}/restart-docker"
+assert_success 'Docker Desktop starts for cleanup when its engine is stopped' prepare_docker_for_cleanup
+assert_equal 'running' "$(/bin/cat "$docker_state")" 'Docker engine is ready before prune'
+assert_success 'Docker running state is detected' docker_desktop_is_running
+assert_success 'Docker safe prune succeeds' prune_docker_unused_data
+assert_equal 'system prune --force' "$(/bin/cat "$docker_capture")" 'Docker prune excludes volumes and all-image removal'
+assert_success 'Docker Desktop stops through its CLI' stop_docker_desktop
+assert_equal 'stopped' "$(/bin/cat "$docker_state")" 'Docker Desktop reaches stopped state'
+assert_success 'Docker Desktop restarts from the recovery marker' restart_docker_from_marker
+assert_equal 'running' "$(/bin/cat "$docker_state")" 'Docker Desktop reaches running state'
+DOCKER_CLI=$saved_docker_cli
+DOCKER_APP_PATH=$saved_docker_app_path
+DOCKER_RESTART_REQUIRED=$saved_docker_restart_required
+RECOVERY_DIR=$saved_recovery_dir
+unset BAMA_TEST_DOCKER_STATE BAMA_TEST_DOCKER_CAPTURE
+
 agent="${temporary}/agent"
 /bin/mkdir -p "${agent}/_work"
 assert_success 'direct _work path is accepted' validate_work_directory "$agent" "${agent}/_work"
@@ -133,7 +178,9 @@ STATE_DIR="${temporary}/heartbeat-state"
 RECOVERY_DIR="${STATE_DIR}/recovery"
 /bin/mkdir -p "$STATE_DIR"
 DISCOVERED_AGENTS=()
+DOCKER_RESTART_REQUIRED=1
 assert_success 'recovery marker can be created' write_recovery_marker
+assert_success 'recovery marker records Docker restart' test -f "${RECOVERY_DIR}/restart-docker"
 heartbeat_before=$(/usr/bin/stat -f '%m' "${RECOVERY_DIR}/heartbeat")
 start_heartbeat
 /bin/sleep 6
@@ -146,6 +193,7 @@ else
     failures=$((failures + 1))
 fi
 remove_recovery_marker
+DOCKER_RESTART_REQUIRED=0
 
 if [ "$failures" -ne 0 ]; then
     /usr/bin/printf '%s test(s) failed.\n' "$failures" >&2

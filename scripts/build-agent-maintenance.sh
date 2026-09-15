@@ -11,6 +11,7 @@ WORK_DELETE_RETRY_SECONDS=5
 SCHEDULER_POLL_SECONDS=15
 WATCHDOG_HARD_TIMEOUT_SECONDS=3600
 AGENT_SEARCH_ROOTS=("${HOME}/azba")
+XCODE_DERIVED_DATA_DIR="${HOME}/Library/Developer/Xcode/DerivedData"
 
 set -o pipefail
 
@@ -604,6 +605,54 @@ terminate_build_processes() {
     return 0
 }
 
+validate_xcode_derived_data_directory() {
+    local home=$1 derived_data=$2 canonical_home canonical_parent parent
+    [ "${derived_data##*/}" = 'DerivedData' ] || return 1
+    [ ! -L "$derived_data" ] || return 1
+    canonical_home=$(/usr/bin/python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$home") || return 1
+    parent=$(/usr/bin/dirname "$derived_data")
+    canonical_parent=$(/usr/bin/python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$parent") || return 1
+    case "$canonical_home" in /|'') return 1 ;; esac
+    [ "$canonical_parent" = "${canonical_home}/Library/Developer/Xcode" ]
+}
+
+clean_xcode_derived_data() {
+    local attempt error_line
+    if [ ! -e "$XCODE_DERIVED_DATA_DIR" ] && [ ! -L "$XCODE_DERIVED_DATA_DIR" ]; then
+        log INFO "Xcode DerivedData directory does not exist: $XCODE_DERIVED_DATA_DIR"
+        return 0
+    fi
+    if ! recovery_is_owned_by_current_process || ! all_agents_are_stopped; then
+        log ERROR "Xcode DerivedData cleanup blocked because the recovery lease is missing or an agent is running."
+        return 1
+    fi
+    if ! validate_xcode_derived_data_directory "$HOME" "$XCODE_DERIVED_DATA_DIR"; then
+        log ERROR "Refusing unsafe Xcode DerivedData path: $XCODE_DERIVED_DATA_DIR"
+        return 1
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log DRYRUN "Would remove Xcode DerivedData directory: $XCODE_DERIVED_DATA_DIR"
+        return 0
+    fi
+    log WARN "Removing Xcode DerivedData directory: $XCODE_DERIVED_DATA_DIR"
+    attempt=1
+    while [ "$attempt" -le "$WORK_DELETE_RETRIES" ]; do
+        /bin/rm -rf -- "$XCODE_DERIVED_DATA_DIR" 2>&1 | while IFS= read -r error_line; do log WARN "$error_line"; done
+        [ ! -e "$XCODE_DERIVED_DATA_DIR" ] && [ ! -L "$XCODE_DERIVED_DATA_DIR" ] && break
+        if [ "$attempt" -lt "$WORK_DELETE_RETRIES" ]; then
+            log WARN "Xcode DerivedData still exists. Retrying in ${WORK_DELETE_RETRY_SECONDS} seconds."
+            /bin/sleep "$WORK_DELETE_RETRY_SECONDS"
+        fi
+        attempt=$((attempt + 1))
+    done
+    if [ -e "$XCODE_DERIVED_DATA_DIR" ] || [ -L "$XCODE_DERIVED_DATA_DIR" ]; then
+        log ERROR "Could not remove Xcode DerivedData after ${WORK_DELETE_RETRIES} attempts: $XCODE_DERIVED_DATA_DIR"
+        return 1
+    fi
+    log INFO "Xcode DerivedData was removed."
+    return 0
+}
+
 free_disk_percent() {
     /bin/df -Pk "$1" | /usr/bin/awk 'NR == 2 { gsub(/%/, "", $5); print 100 - $5 }'
 }
@@ -755,6 +804,8 @@ run_maintenance() {
     elif ! shutdown_booted_simulators; then
         failed=1
     elif ! terminate_build_processes; then
+        failed=1
+    elif ! clean_xcode_derived_data; then
         failed=1
     elif ! clean_work_directories_if_low_disk; then
         failed=1

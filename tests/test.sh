@@ -64,6 +64,34 @@ assert_failure 'another agent worker does not mark this agent busy' command_is_a
 
 temporary=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/bama-test.XXXXXX")
 trap '/bin/rm -rf -- "$temporary"' EXIT
+
+xcode_home="${temporary}/home"
+xcode_parent="${xcode_home}/Library/Developer/Xcode"
+xcode_derived_data="${xcode_parent}/DerivedData"
+/bin/mkdir -p "$xcode_derived_data"
+assert_success 'standard Xcode DerivedData path is accepted' validate_xcode_derived_data_directory "$xcode_home" "$xcode_derived_data"
+assert_failure 'a different Xcode directory is rejected' validate_xcode_derived_data_directory "$xcode_home" "${xcode_parent}/Archives"
+/bin/rm -rf "$xcode_derived_data"
+/bin/ln -s /tmp "$xcode_derived_data"
+assert_failure 'symlinked Xcode DerivedData path is rejected' validate_xcode_derived_data_directory "$xcode_home" "$xcode_derived_data"
+/bin/rm "$xcode_derived_data"
+/bin/mkdir -p "$xcode_derived_data"
+: > "${xcode_derived_data}/build-cache"
+saved_home=$HOME
+saved_recovery_dir=$RECOVERY_DIR
+saved_derived_data_dir=$XCODE_DERIVED_DATA_DIR
+HOME=$xcode_home
+RECOVERY_DIR="${temporary}/derived-data-recovery"
+XCODE_DERIVED_DATA_DIR=$xcode_derived_data
+DISCOVERED_AGENTS=()
+/bin/mkdir -p "$RECOVERY_DIR"
+/usr/bin/printf '%s\n' "$$" > "${RECOVERY_DIR}/owner-pid"
+assert_success 'Xcode DerivedData cleanup removes the guarded directory' clean_xcode_derived_data
+assert_failure 'Xcode DerivedData directory no longer exists' test -e "$xcode_derived_data"
+HOME=$saved_home
+RECOVERY_DIR=$saved_recovery_dir
+XCODE_DERIVED_DATA_DIR=$saved_derived_data_dir
+
 agent="${temporary}/agent"
 /bin/mkdir -p "${agent}/_work"
 assert_success 'direct _work path is accepted' validate_work_directory "$agent" "${agent}/_work"

@@ -29,8 +29,9 @@ launchd restart during the same minute does not run maintenance twice.
 4. Confirms every agent service is stopped. Cleanup does not run if this check fails.
 5. Shuts down all booted Apple Simulator devices and waits up to 30 seconds for shutdown.
 6. Sends `TERM`, waits up to 10 seconds, then sends `KILL` to remaining targeted processes.
-7. Deletes each agent's `_work` directory only when disk free space is below 20 percent.
-8. Starts every discovered agent and removes the recovery marker after all starts succeed.
+7. Removes `~/Library/Developer/Xcode/DerivedData` after validating the path is not a symlink.
+8. Deletes each agent's `_work` directory only when disk free space is below 20 percent.
+9. Starts every discovered agent and removes the recovery marker after all starts succeed.
 
 The cleanup targets orphaned Azure `Agent.Worker` processes, all processes whose command belongs to
 an agent `_work` directory, all Node.js and Watchman processes, Android build and emulator
